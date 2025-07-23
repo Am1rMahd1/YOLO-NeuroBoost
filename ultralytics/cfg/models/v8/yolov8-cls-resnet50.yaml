@@ -16,12 +16,8 @@ scales: # model compound scaling constants, i.e. 'model=yolov8n-cls.yaml' will c
 
 # YOLOv8.0n backbone
 backbone:
-  # [from, repeats, module, args]
-  - [-1, 1, ResNetLayer, [3, 64, 1, True, 1]] # 0-P1/2
-  - [-1, 1, ResNetLayer, [64, 64, 1, False, 3]] # 1-P2/4
-  - [-1, 1, ResNetLayer, [256, 128, 2, False, 4]] # 2-P3/8
-  - [-1, 1, ResNetLayer, [512, 256, 2, False, 6]] # 3-P4/16
-  - [-1, 1, ResNetLayer, [1024, 512, 2, False, 3]] # 4-P5/32
+  - [-1, 1, KernelWarehouse, [64, 128, 3, 1, 1]]  # Replace Conv2D with KernelWarehouse
+  - [-1, 1, CBAM, [128]]                          # Add CBAM after KernelWarehouse
 
 # YOLOv8.0n head
 head:

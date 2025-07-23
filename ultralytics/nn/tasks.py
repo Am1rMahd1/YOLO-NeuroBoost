@@ -94,6 +94,48 @@ from ultralytics.utils.torch_utils import (
 )
 
 
+class KernelWarehouse(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, num_kernels=4):
+        super().__init__()
+        self.num_kernels = num_kernels
+        self.out_channels = out_channels
+        self.kernels = nn.ModuleList([
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding) for _ in range(num_kernels)
+        ])
+        self.attention_weights = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(out_channels, num_kernels, 1),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, x):
+        kernel_outputs = torch.stack([k(x) for k in self.kernels], dim=1)
+        attention = self.attention_weights(kernel_outputs.sum(dim=1))
+        output = (kernel_outputs * attention.unsqueeze(2)).sum(dim=1)
+        return output
+
+
+class CBAM(nn.Module):
+    def __init__(self, channels, reduction=16, kernel_size=7):
+        super().__init__()
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False),
+            nn.Sigmoid()
+        )
+        self.spatial_attention = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size, padding=(kernel_size // 2), bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        ca = self.channel_attention(x) * x
+        sa = self.spatial_attention(torch.cat([ca.mean(dim=1, keepdim=True), ca.max(dim=1, keepdim=True)[0]], dim=1))
+        return sa * ca + x
+
+
 class BaseModel(torch.nn.Module):
     """
     Base class for all YOLO models in the Ultralytics family.
@@ -1666,76 +1708,86 @@ def parse_model(d, ch, verbose=True):
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        m = (
-            getattr(torch.nn, m[3:])
-            if "nn." in m
-            else getattr(__import__("torchvision").ops, m[16:])
-            if "torchvision.ops." in m
-            else globals()[m]
-        )  # get module
-        for j, a in enumerate(args):
-            if isinstance(a, str):
-                with contextlib.suppress(ValueError):
-                    args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
-        n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
-        if m in base_modules:
-            c1, c2 = ch[f], args[0]
-            if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
-                c2 = make_divisible(min(c2, max_channels) * width, 8)
-            if m is C2fAttn:  # set 1) embed channels and 2) num heads
-                args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
-                args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
+        # Handle custom layers: KernelWarehouse and CBAM
+        if m == "Conv":  # Replace Conv with KernelWarehouse
+            m = KernelWarehouse
+            args = [ch[f], args[0], 3, 1, 1, 4]  # Example args for KernelWarehouse
+        elif m == "CBAM":  # Add CBAM after layers
+            m = CBAM
+            args = [ch[f], 16, 7]  # Example args for CBAM
 
-            args = [c1, c2, *args[1:]]
-            if m in repeat_modules:
-                args.insert(2, n)  # number of repeats
-                n = 1
-            if m is C3k2:  # for M/L/X sizes
-                legacy = False
-                if scale in "mlx":
-                    args[3] = True
-            if m is A2C2f:
-                legacy = False
-                if scale in "lx":  # for L/X sizes
-                    args.extend((True, 1.2))
-            if m is C2fCIB:
-                legacy = False
-        elif m is AIFI:
-            args = [ch[f], *args]
-        elif m in frozenset({HGStem, HGBlock}):
-            c1, cm, c2 = ch[f], args[0], args[1]
-            args = [c1, cm, c2, *args[2:]]
-            if m is HGBlock:
-                args.insert(4, n)  # number of repeats
-                n = 1
-        elif m is ResNetLayer:
-            c2 = args[1] if args[3] else args[1] * 4
-        elif m is torch.nn.BatchNorm2d:
-            args = [ch[f]]
-        elif m is Concat:
-            c2 = sum(ch[x] for x in f)
-        elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
-        ):
-            args.append([ch[x] for x in f])
-            if m is Segment or m is YOLOESegment:
-                args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
-                m.legacy = legacy
-        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
-            args.insert(1, [ch[x] for x in f])
-        elif m is CBLinear:
-            c2 = args[0]
-            c1 = ch[f]
-            args = [c1, c2, *args[1:]]
-        elif m is CBFuse:
-            c2 = ch[f[-1]]
-        elif m in frozenset({TorchVision, Index}):
-            c2 = args[0]
-            c1 = ch[f]
-            args = [*args[1:]]
+        # Handle standard modules
         else:
-            c2 = ch[f]
+            m = (
+                getattr(torch.nn, m[3:])
+                if "nn." in m
+                else getattr(__import__("torchvision").ops, m[16:])
+                if "torchvision.ops." in m
+                else globals()[m]
+            )  # get module
+            for j, a in enumerate(args):
+                if isinstance(a, str):
+                    with contextlib.suppress(ValueError):
+                        args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
+            n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+            if m in base_modules:
+                c1, c2 = ch[f], args[0]
+                if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+                    c2 = make_divisible(min(c2, max_channels) * width, 8)
+                if m is C2fAttn:  # set 1) embed channels and 2) num heads
+                    args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
+                    args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
+
+                args = [c1, c2, *args[1:]]
+                if m in repeat_modules:
+                    args.insert(2, n)  # number of repeats
+                    n = 1
+                if m is C3k2:  # for M/L/X sizes
+                    legacy = False
+                    if scale in "mlx":
+                        args[3] = True
+                if m is A2C2f:
+                    legacy = False
+                    if scale in "lx":  # for L/X sizes
+                        args.extend((True, 1.2))
+                if m is C2fCIB:
+                    legacy = False
+            elif m is AIFI:
+                args = [ch[f], *args]
+            elif m in frozenset({HGStem, HGBlock}):
+                c1, cm, c2 = ch[f], args[0], args[1]
+                args = [c1, cm, c2, *args[2:]]
+                if m is HGBlock:
+                    args.insert(4, n)  # number of repeats
+                    n = 1
+            elif m is ResNetLayer:
+                c2 = args[1] if args[3] else args[1] * 4
+            elif m is torch.nn.BatchNorm2d:
+                args = [ch[f]]
+            elif m is Concat:
+                c2 = sum(ch[x] for x in f)
+            elif m in frozenset(
+                    {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            ):
+                args.append([ch[x] for x in f])
+                if m is Segment or m is YOLOESegment:
+                    args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+                if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+                    m.legacy = legacy
+            elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
+                args.insert(1, [ch[x] for x in f])
+            elif m is CBLinear:
+                c2 = args[0]
+                c1 = ch[f]
+                args = [c1, c2, *args[1:]]
+            elif m is CBFuse:
+                c2 = ch[f[-1]]
+            elif m in frozenset({TorchVision, Index}):
+                c2 = args[0]
+                c1 = ch[f]
+                args = [*args[1:]]
+            else:
+                c2 = ch[f]
 
         m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
         t = str(m)[8:-2].replace("__main__.", "")  # module type

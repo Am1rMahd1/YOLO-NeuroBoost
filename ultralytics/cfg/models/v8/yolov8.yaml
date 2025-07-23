@@ -16,8 +16,8 @@ scales: # model compound scaling constants, i.e. 'model=yolov8n.yaml' will call 
 
 # YOLOv8.0n backbone
 backbone:
-  - [KernelWarehouse, 64, 128, 3, 1, 1]  # Replace Conv2D with KernelWarehouse
-  - [CBAM, 128]                          # Add CBAM after KernelWarehouse
+  - [-1, 1, KernelWarehouse, [64, 128, 3, 1, 1]]  # Replace Conv2D with KernelWarehouse
+  - [-1, 1, CBAM, [128]]                          # Add CBAM after KernelWarehouse
 
 # YOLOv8.0n head
 head:

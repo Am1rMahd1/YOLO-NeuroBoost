@@ -1708,6 +1708,11 @@ def parse_model(d, ch, verbose=True):
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+        print(f"Layer {i}: from={f}, module={m}, args={args}")  # Debugging
+        if isinstance(f, list):
+            for x in f:
+                if x >= len(ch):  # Check if index is out of range
+                    raise IndexError(f"Invalid layer index {x} in 'from'. Layer {i} references non-existent layer.")
         # Handle custom layers: KernelWarehouse and CBAM
         if m == "Conv":  # Replace Conv with KernelWarehouse
             m = KernelWarehouse
